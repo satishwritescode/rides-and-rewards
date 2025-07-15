@@ -1,0 +1,406 @@
+---
+title: "Final Group Project: Updated Checkpoint Submission"
+author: "Team 10"
+date: "`r Sys.Date()`"
+output:
+  pdf_document
+---
+
+
+# Introduction
+
+This document contains the updated checkpoint submission for our Final Group Project. We have thoroughly reviewed the feedback provided and incorporated suggested actions to enhance our project. This document includes all the code and visualizations used in our analysis. 
+
+# Research question 
+
+Just state research question, assumptions and why the particular data and model is adequate to answer that question
+
+How can we effectively predict the total fare of yellow taxi trips in New York City using available trip data, and what factors most significantly contribute to the variability in fares charged to passengers?
+
+
+The chosen dataset for this research contains comprehensive records of yellow taxi trips in New York City, including key variables such as trip distance, fare amount, passenger count, congestion surcharge, airport fee, and extra charges. This dataset is an invaluable resource for understanding urban mobility patterns and the factors that influence taxi fares. By analyzing this data, we can gain insights into fare structures, identify areas for potential efficiency improvements, and better predict fare costs for budgeting or regulatory purposes.
+
+#Data Preparation and Cleaning
+```{r}
+if (!require("arrow")) {
+  install.packages("arrow")
+}
+library(lubridate)
+library(arrow)
+library(caret)
+library(dplyr)
+if (!require("randomForest")) {
+  install.packages("randomForest")
+}
+library(randomForest)
+library(ggplot2)
+library(sf)
+library(readr)
+if (!requireNamespace("lubridate", quietly = TRUE)) {
+  install.packages("lubridate")
+}
+library(lubridate)
+
+```
+
+# This R chunk is designed to load two datasets related to NYC taxi trips. 
+# The first dataset, 'taxi_zones.csv', contains information about taxi zones, including geographical details.
+# The second dataset, 'yellow_tripdata_2024-01.parquet', contains detailed trip records for yellow taxis in NYC for January 2024.
+# The datasets are loaded into the R environment and the structure of the trip data is displayed.
+
+```{r}
+# Read the dataset
+file_path1 <- "C:/Users/dsang/Downloads/taxi_zone_lookup.csv"
+zones_data <- read_csv(file_path1)
+
+file_path <- "C:/Users/dsang/Downloads/yellow_tripdata_2024-01.parquet"
+data <- read_parquet(file_path)
+
+print(data)
+```
+#Pre-processing
+```{r}
+# Subset the data to include only credit card data (looking at tips only)
+cc_data <- data[data$payment_type == 1, ]
+
+# Ensure that your datetime columns are in POSIXct format
+cc_data$tpep_pickup_datetime <- ymd_hms(cc_data$tpep_pickup_datetime)
+cc_data$tpep_dropoff_datetime <- ymd_hms(cc_data$tpep_dropoff_datetime)
+
+# Subset the data to include only hours
+cc_data$PU_hour <- hour(cc_data$tpep_pickup_datetime)
+cc_data$DO_hour <- hour(cc_data$tpep_dropoff_datetime)
+
+# Extract just the time part of the datetime
+cc_data$pickup_time <- format(cc_data$tpep_pickup_datetime, "%H:%M:%S")
+cc_data$dropoff_time <- format(cc_data$tpep_dropoff_datetime, "%H:%M:%S")
+
+# Calculate the duration in minutes
+cc_data$duration <- as.numeric(difftime(cc_data$tpep_dropoff_datetime, cc_data$tpep_pickup_datetime, units = "mins"))
+
+# Extract the day of the week from the datetime (1 = Sunday, 7 = Saturday)
+cc_data$pickup_day <- wday(cc_data$tpep_pickup_datetime, label = TRUE, abbr = FALSE)
+cc_data$dropoff_day <- wday(cc_data$tpep_dropoff_datetime, label = TRUE, abbr = FALSE)
+
+# Creating a new column 'isweekend' to determine if the day is a weekend
+cc_data$isweekend <- if_else(cc_data$pickup_day %in% c("Saturday", "Friday", "Sunday") | cc_data$dropoff_day %in% c("Saturday", "Friday", "Sunday"), TRUE, FALSE)
+
+# Creating added_fees_ratio column
+cc_data$added_fees_ratio <- (cc_data$improvement_surcharge + cc_data$congestion_surcharge + cc_data$tolls_amount + cc_data$Airport_fee + cc_data$mta_tax + cc_data$extra) / (cc_data$total_amount + cc_data$Airport_fee + cc_data$congestion_surcharge)
+
+# Creating a daytime column
+cc_data$daytime_PU <- ifelse(cc_data$PU_hour >= 7 & cc_data$PU_hour <= 18, TRUE, FALSE)
+cc_data$daytime_DO <- ifelse(cc_data$DO_hour >= 7 & cc_data$DO_hour <= 18, TRUE, FALSE)
+
+
+# Pre-processing: Remove any rows with NA values for the features we are interested in
+prepared_data <- cc_data %>%
+  select(tip_amount, PU_hour, DO_hour, daytime_PU, daytime_DO, PULocationID, DOLocationID, total_amount, trip_distance, mta_tax, improvement_surcharge, congestion_surcharge, tolls_amount, fare_amount, passenger_count, Airport_fee, extra, duration, isweekend, added_fees_ratio) %>%
+  na.omit()
+
+# Spliting the data into training and testing sets
+
+set.seed(123)  # for reproducibility
+
+# Sampling 10% of the data without replacement
+sampled_data <- prepared_data %>%
+  sample_frac(size = 0.1, replace = FALSE)
+
+# Removing values less than 0 for tip_amount and fare_amount
+sampled_data <- sampled_data[sampled_data$tip_amount >= 0 & sampled_data$fare_amount >= 0, ]
+
+# Displaying the number of rows in the sampled data
+print(nrow(sampled_data))
+
+index <- createDataPartition(sampled_data$tip_amount, p = 0.8, list = FALSE)
+train_data <- sampled_data[index, ]
+test_data <- sampled_data[-index, ]
+
+# Defining a function to calculate added fees ratio with checks for zero denominators
+calculate_added_fees_ratio <- function(data) {
+  added_fees_ratio <- (data$improvement_surcharge + data$congestion_surcharge + data$tolls_amount + data$Airport_fee + data$mta_tax + data$extra) /
+                      (data$total_amount + data$Airport_fee + data$congestion_surcharge)
+  added_fees_ratio[is.nan(added_fees_ratio)] <- 0  
+  return(added_fees_ratio)
+}
+
+# Calculating added fees ratio for both train and test datasets
+test_data$added_fees_ratio <- calculate_added_fees_ratio(test_data)
+train_data$added_fees_ratio <- calculate_added_fees_ratio(train_data)
+
+print(nrow(train_data))
+print(nrow(test_data))
+
+```
+
+#Model 1
+```{r}
+# Defining the model using the training data
+glm_model <- glm(tip_amount ~ PU_hour + DO_hour + daytime_PU + daytime_DO + PULocationID + DOLocationID + total_amount + 
+              trip_distance + mta_tax + improvement_surcharge + congestion_surcharge + fare_amount + 
+              passenger_count + congestion_surcharge + tolls_amount + Airport_fee + extra + duration + isweekend +
+               added_fees_ratio,
+            data = train_data,
+            family = gaussian)
+
+
+# Summary of the model to check the coefficients and the overall fit
+summary(model)
+
+# Making predictions
+glm_predictions <- predict(glm_model, newdata = test_data, type = "response")
+
+# Calculating evaluation metrics
+library(Metrics)
+mae <- mae(test_data$tip_amount, glm_predictions)
+mse <- mse(test_data$tip_amount, glm_predictions)
+rmse <- sqrt(mse)
+r_squared <- R2(test_data$tip_amount, glm_predictions)
+
+# GLM AUC
+library(pROC)
+glmProbabilities <- predict(glm_model, newdata=test_data, type="response")
+glmROC <- roc(response=test_data$tip_amount, predictor=glmProbabilities)
+glmAUC <- auc(glmROC)
+
+
+# Printing evaluation metrics
+print(paste("Mean Absolute Error (MAE):", mae))
+print(paste("Mean Squared Error (MSE):", mse))
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+print(paste("R-squared (R2):", r_squared))
+print(paste("GLM AUC:", glmAUC))
+
+```
+
+# Feature Engineering
+```{r}
+
+# Defining the model using the training data
+glm_model <- glm(tip_amount ~ PU_hour + DO_hour + daytime_PU + daytime_DO + Airport_fee +
+              trip_distance + fare_amount + added_fees_ratio + duration + passenger_count + isweekend,
+            data = train_data,
+            family = gaussian)
+
+
+# Summary of the model to check the coefficients and the overall fit
+summary(glm_model)
+
+# Making predictions
+glm_predictions <- predict(glm_model, newdata = test_data, type = "response")
+
+# Calculating evaluation metrics
+library(Metrics)
+mae <- mae(test_data$tip_amount, glm_predictions)
+mse <- mse(test_data$tip_amount, glm_predictions)
+rmse <- sqrt(mse)
+r_squared <- R2(test_data$tip_amount, glm_predictions)
+
+# GLM AUC
+library(pROC)
+glmProbabilities <- predict(glm_model, newdata=test_data, type="response")
+glmROC <- roc(response=test_data$tip_amount, predictor=glmProbabilities)
+glmAUC <- auc(glmROC)
+
+
+# Printing evaluation metrics
+print(paste("Mean Absolute Error (MAE):", mae))
+print(paste("Mean Squared Error (MSE):", mse))
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+print(paste("R-squared (R2):", r_squared))
+print(paste("GLM AUC:", glmAUC))
+
+```
+# Cross Validation with Ridge
+```{r}
+# Loading necessary libraries
+if (!requireNamespace("boot", quietly = TRUE)) {
+  install.packages("boot")
+}
+library(boot)
+
+if (!requireNamespace("glmnet", quietly = TRUE)) {
+  install.packages("glmnet")
+}
+library(glmnet)
+
+# Defining the model formula
+formula <- tip_amount ~ PU_hour + DO_hour + daytime_PU + daytime_DO + 
+              trip_distance + fare_amount + added_fees_ratio + duration + passenger_count + isweekend
+
+# Converting data to matrix format
+X <- as.matrix(train_data[, -1])  # Exclude the response variable
+y <- train_data[, 1]  # Response variable
+
+# Converting the response column to a numeric vector
+y <- as.numeric(as.vector(train_data$tip_amount))
+
+# Performing cross-validated ridge regression
+ridge_cv <- cv.glmnet(X, y, alpha = 0, lambda = seq(0.001, 1, length = 100), nfolds = 10)  # 10-fold cross-validation
+
+plot(ridge_cv)
+
+# Getting the optimal lambda value
+optimal_lambda <- ridge_cv$lambda.min
+print(paste("Optimal lambda:", optimal_lambda))
+
+# Fitting the ridge regression model with the optimal lambda
+ridge_final_model <- glmnet(X, y, alpha = 0, lambda = optimal_lambda)
+
+# Making predictions
+ridge_predictions <- predict(ridge_final_model, newx = as.matrix(test_data[, -1]))
+
+# Calculating evaluation metrics
+mae <- mae(test_data$tip_amount, ridge_predictions)
+mse <- mse(test_data$tip_amount, ridge_predictions)
+rmse <- sqrt(mse)
+r_squared <- R2(test_data$tip_amount, ridge_predictions)
+
+# GLM AUC
+glmROC <- roc(test_data$tip_amount, ridge_predictions)
+glmAUC <- auc(glmROC)
+
+# Printing evaluation metrics
+print(paste("Mean Absolute Error (MAE):", mae))
+print(paste("Mean Squared Error (MSE):", mse))
+print(paste("Root Mean Squared Error (RMSE):", rmse))
+print(paste("R-squared (R2):", r_squared))
+print(paste("GLM AUC:", glmAUC))
+```
+
+# Model Diagnostics for Logistic Regression
+```{r}
+# Calculating fitted probabilities
+fitted_probabilities <- predict(glm_model, type = "response")
+
+# Extracting deviance residuals
+deviance_residuals <- residuals(glm_model, type = "deviance")
+
+# Plotting deviance residuals against fitted probabilities
+plot(fitted_probabilities, deviance_residuals, xlab = "Fitted Probabilities", ylab = "Deviance Residuals")
+abline(h = 0, col = "red")
+```
+
+
+#EDA and Results
+```{r}
+data <- data %>%
+  mutate(profit = total_amount - fare_amount)
+
+# Counting the frequency of each PULocationID
+pu_frequency <- data %>%
+  group_by(PULocationID) %>%
+  summarise(Frequency = n()) %>%
+  ungroup() %>%
+  arrange(desc(Frequency))
+
+# Counting the frequency of each DOLocationID
+do_frequency <- data %>%
+  group_by(DOLocationID) %>%
+  summarise(Frequency = n()) %>%
+  ungroup() %>%
+  arrange(desc(Frequency))
+
+# Plotting the frequencies for PULocationID
+ggplot(pu_frequency, aes(x = PULocationID, y = Frequency)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Pickup Location Frequency", x = "Pickup Location ID", y = "Frequency") +
+  theme_minimal()
+
+# Plotting the frequencies for DOLocationID
+ggplot(do_frequency, aes(x = DOLocationID, y = Frequency)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  labs(title = "Drop-off Location Frequency", x = "Drop-off Location ID", y = "Frequency") +
+  theme_minimal()
+
+
+```
+
+```{r}
+# New sample data for prediction 
+new_data <- data.frame(
+  trip_distance = 3.5,       # example distance in miles
+  fare_amount = 12.5,        # example fare amount in your currency
+  passenger_count = 2,       # example passenger count
+  congestion_surcharge = 2.5, # example congestion surcharge fee
+  Airport_fee = 5.0,         # example airport fee
+  extra = 1.0                # example extra charges
+)
+
+# top N locations
+top_n_locations <- 20
+
+# Plotting top N locations for PULocationID
+ggplot(pu_frequency[1:top_n_locations, ], aes(x = reorder(PULocationID, Frequency), y = Frequency)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = paste("Top", top_n_locations, "Pickup Location Frequencies"), x = "Pickup Location ID", y = "Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Plotting top N locations for DOLocationID
+ggplot(do_frequency[1:top_n_locations, ], aes(x = reorder(DOLocationID, Frequency), y = Frequency)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  labs(title = paste("Top", top_n_locations, "Drop-off Location Frequencies"), x = "Drop-off Location ID", y = "Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Using the model to predict total fare
+predicted_fare <- predict(glm_model, newdata = new_data)
+
+# Printing the predicted fare
+print(predicted_fare)
+```
+#Analysis
+```{r}
+data$tpep_pickup_datetime <- ymd_hms(data$tpep_pickup_datetime)
+
+# Tip Amount vs. PULocationID and DOLocationID
+data %>%
+  group_by(PULocationID) %>%
+  summarise(Avg_Tip = mean(tip_amount, na.rm = TRUE)) %>%
+  ggplot(aes(x = reorder(PULocationID, Avg_Tip), y = Avg_Tip)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(x = "Pickup Location ID", y = "Average Tip Amount", title = "Average Tip by Pickup Location")
+
+data %>%
+  group_by(DOLocationID) %>%
+  summarise(Avg_Tip = mean(tip_amount, na.rm = TRUE)) %>%
+  ggplot(aes(x = reorder(DOLocationID, Avg_Tip), y = Avg_Tip)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  theme_minimal() +
+  labs(x = "Drop-off Location ID", y = "Average Tip Amount", title = "Average Tip by Drop-off Location")
+
+# Tip Amount vs. Time of Day
+data %>%
+  mutate(Hour = hour(tpep_pickup_datetime)) %>%
+  group_by(Hour) %>%
+  summarise(Avg_Tip = mean(tip_amount, na.rm = TRUE)) %>%
+  ggplot(aes(x = Hour, y = Avg_Tip)) +
+  geom_line(group = 1, color = "blue") +
+  labs(x = "Hour of the Day", y = "Average Tip Amount", title = "Average Tip by Time of Day")
+
+# Tip Amount vs. Number of Passengers
+ggplot(data, aes(x = passenger_count, y = tip_amount)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Number of Passengers", y = "Tip Amount", title = "Tip Amount by Number of Passengers")
+
+# Tip Amount vs. Fare Charged
+ggplot(data, aes(x = fare_amount, y = tip_amount)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "green") +
+  labs(x = "Fare Charged", y = "Tip Amount", title = "Tip Amount by Fare Charged")
+
+
+```
+
+```{r}
+# Tip Amount vs. Fare Charged
+ggplot(data, aes(x = trip_distance, y = tip_amount)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "green") +
+  labs(x = "Fare Charged", y = "Tip Amount", title = "Tip Amount by Fare Charged")
+
+```
+
